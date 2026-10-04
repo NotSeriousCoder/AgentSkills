@@ -12,6 +12,15 @@ session on another device:
 
 The staging folder is then uploaded via storage_backend.py (see push_session.py for the
 one-shot flow) and restored on the target device via sync_import.py (see pull_session.py).
+
+Note: the manifest also carries `createdAtMs`, `updatedAtMs` and `model` read from the
+conversation JSONL, because the target device needs them to build an accurate
+`workbuddy.db` sessions row (the only thing that makes the session visible in the UI).
+
+formatVersion 3 adds `sourcePlatform` — the product this session came from. The
+importing device compares it with its own detected platform (see sync_import.py);
+a mismatch means "this session belongs to another AI product" and must be surfaced
+to the user before writing anything.
 """
 
 import os
@@ -26,8 +35,29 @@ from path_map import (
     WORKBUDDY_HOME, PROJECTS_DIR, SESSIONS_INDEX,
     encode_workdir, get_leaf_name, get_session_entry, read_sessions_index,
 )
+import wb_db
 
 MANIFEST_NAME = 'sync-manifest.json'
+
+
+def detect_source_platform():
+    """
+    Return the id of the product this session belongs to (best effort), e.g. 'workbuddy'.
+    Falls back to None when detection is unavailable — the importer treats None as
+    "unknown, do not block".
+    """
+    try:
+        from detect_platform import detect_platforms
+        found = detect_platforms()
+        if len(found) == 1:
+            return found[0].get('id')
+        # more than one installed — prefer workbuddy if present, else leave ambiguous
+        ids = [f.get('id') for f in found if f.get('id')]
+        if 'workbuddy' in ids:
+            return 'workbuddy'
+        return ids[0] if ids else None
+    except Exception:
+        return None
 
 
 def detect_conversation_id():
@@ -54,6 +84,40 @@ def read_title_from_jsonl(jsonl_path):
     return ''
 
 
+def read_jsonl_meta(jsonl_path):
+    """
+    Scan the JSONL for the fields the target device needs to register the session:
+        (first_ts_ms, last_ts_ms, model)
+    `model` is the most common model name found in `providerData`.
+    """
+    first_ts = last_ts = None
+    models = {}
+    try:
+        with open(jsonl_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                pd = obj.get('providerData')
+                if isinstance(pd, dict):
+                    for k, v in pd.items():
+                        if 'model' in k.lower() and isinstance(v, str):
+                            models[v] = models.get(v, 0) + 1
+                ts = obj.get('timestamp')
+                if ts:
+                    if first_ts is None:
+                        first_ts = ts
+                    last_ts = ts
+    except IOError:
+        pass
+    model = max(models, key=models.get) if models else None
+    return first_ts, last_ts, model
+
+
 def copy_tree_filtered(src, dst, skip_names=None):
     """Copy a directory tree, skipping given dir/file names. Returns copied rel paths."""
     skip_names = set(skip_names or [])
@@ -75,12 +139,16 @@ def copy_tree_filtered(src, dst, skip_names=None):
 
 
 def export_session(conversation_id, work_dir, out_dir,
-                   include_outputs=True, include_memory=True):
+                   include_outputs=True, include_memory=True,
+                   source_platform=None):
     """Export a single session into out_dir. Returns the manifest dict."""
-    # Resolve workDir if not provided
+    # Resolve workDir: prefer workbuddy.db (authoritative), fall back to sessions.json
+    db_row = wb_db.get_session_full(conversation_id)
     entry = get_session_entry(conversation_id)
     if not work_dir:
-        if entry:
+        if db_row and db_row.get('cwd'):
+            work_dir = db_row['cwd']
+        elif entry:
             work_dir = entry.get('workDir')
         else:
             raise SystemExit(f"错误：找不到会话 {conversation_id} 的 workDir，请用 --workdir 指定")
@@ -125,14 +193,22 @@ def export_session(conversation_id, work_dir, out_dir,
         files += [f'workspace/.workbuddy/{p}' for p in copied]
 
     # 4. manifest
+    first_ts, last_ts, model = read_jsonl_meta(src_jsonl)
     manifest = {
-        'formatVersion': 1,
+        'formatVersion': 3,
         'conversationId': conversation_id,
         'sourceWorkDir': work_dir,
         'sourceProjectsDir': encoded,
         'sourceLeafName': get_leaf_name(work_dir),
+        # 源平台：导入端拿它做「平台匹配校验」（v3 新增）
+        'sourcePlatform': source_platform or detect_source_platform(),
         'sessionEntry': session_entry,
         'title': read_title_from_jsonl(src_jsonl) or get_leaf_name(work_dir),
+        # 目标设备建 workbuddy.db 行所需（v2 新增）
+        'createdAtMs': first_ts,
+        'updatedAtMs': last_ts,
+        'model': model,
+        'userId': (db_row or {}).get('user_id') or session_entry.get('userId', ''),
         'packedAt': datetime.now().isoformat(),
         'packedBy': 'work-context-sync (hardcore mode)',
         'includesOutputs': include_outputs,
@@ -152,6 +228,7 @@ def main():
     ap.add_argument('--out', required=True, help='staging output directory')
     ap.add_argument('--no-outputs', action='store_true', help='skip outputs/ folder')
     ap.add_argument('--no-memory', action='store_true', help='skip .workbuddy/ folder')
+    ap.add_argument('--source-platform', help='override the recorded source platform id')
     args = ap.parse_args()
 
     conv_id = args.conversation_id or detect_conversation_id()
@@ -164,11 +241,13 @@ def main():
         args.out,
         include_outputs=not args.no_outputs,
         include_memory=not args.no_memory,
+        source_platform=args.source_platform,
     )
 
     print('导出完成')
     print(f'  会话 ID     : {manifest["conversationId"]}')
     print(f'  源工作空间  : {manifest["sourceWorkDir"]}')
+    print(f'  源平台      : {manifest["sourcePlatform"] or "(未识别)"}')
     print(f'  projects 目录: {manifest["sourceProjectsDir"]}')
     print(f'  标题        : {manifest["title"]}')
     print(f'  Staging     : {args.out}')

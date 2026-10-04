@@ -29,6 +29,7 @@ from manage_session_id import (
 )
 from path_map import get_session_entry
 from detect_platform import detect_platforms
+import wb_db
 
 MAX_SIMPLE_UPLOAD = 1 * 1024 * 1024  # warn threshold (platform API soft limit)
 
@@ -89,11 +90,14 @@ def main():
     if not conv_id:
         print('错误: 无法确定 conversationId，请用 --conversation-id 指定')
         return 2
-    entry = get_session_entry(conv_id)
-    if not entry:
-        print(f'错误: 会话索引中没有 {conv_id}')
+    # Resolve workDir: workbuddy.db is authoritative, sessions.json is the legacy fallback
+    work_dir = wb_db.resolve_workdir(conv_id)
+    if not work_dir:
+        entry = get_session_entry(conv_id)
+        work_dir = (entry or {}).get('workDir')
+    if not work_dir:
+        print(f'错误: 在 workbuddy.db / sessions.json 中都找不到会话 {conv_id}')
         return 2
-    work_dir = entry.get('workDir')
     print(f'会话 {conv_id}')
     print(f'工作空间 {work_dir}')
 

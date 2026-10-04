@@ -67,6 +67,10 @@ def main():
     ap.add_argument('session', nargs='?', help='remote session folder name')
     ap.add_argument('--list', action='store_true', help='list remote sessions and exit')
     ap.add_argument('--target-workdir', help='target workspace path on this device')
+    ap.add_argument('--create-workspace', action='store_true',
+                    help='确认新建目标工作空间（路径不存在时必需）')
+    ap.add_argument('--force', action='store_true',
+                    help='平台不匹配时仍继续（默认中止）')
     ap.add_argument('--apply', action='store_true', help='actually write (default: dry-run)')
     ap.add_argument('--backend', choices=('github', 'gitee'), help='override backend')
     args = ap.parse_args()
@@ -103,7 +107,8 @@ def main():
             print(f'文件列表: {sorted(os.listdir(staging))}')
 
         # delegate to sync_import (dry-run unless --apply)
-        rc = import_session(staging, args.target_workdir, args.apply)
+        rc = import_session(staging, args.target_workdir, args.apply,
+                            force=args.force, create_workspace=args.create_workspace)
         return rc
     finally:
         if args.apply:
